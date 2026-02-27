@@ -7,6 +7,7 @@ from pathlib import Path
 
 import aiosqlite
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError, TelegramBadRequest
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -24,14 +25,13 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DB_PATH = "registrations.db"
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не задано. Перевір .env поруч із bot.py")
+    raise RuntimeError("BOT_TOKEN не задано. Перевір .env поруч із reg.py")
 if not GROUP_CHAT_ID:
-    raise RuntimeError("GROUP_CHAT_ID не задано. Перевір .env поруч із bot.py")
+    raise RuntimeError("GROUP_CHAT_ID не задано. Перевір .env поруч із reg.py")
 
 GROUP_CHAT_ID = int(GROUP_CHAT_ID)
 
 
-# --- FSM states ---
 class Reg(StatesGroup):
     first_name = State()
     last_name_or_nick = State()
@@ -39,7 +39,6 @@ class Reg(StatesGroup):
     games = State()
 
 
-# --- helpers ---
 def clean(s: str) -> str:
     s = (s or "").strip()
     s = re.sub(r"\s+", " ", s)
@@ -47,25 +46,17 @@ def clean(s: str) -> str:
 
 
 def valid_first_name(s: str) -> bool:
-    # букви (лат/кирилл/укр), пробіл, дефіс, апостроф
     return bool(re.fullmatch(r"[A-Za-zА-Яа-яЁёІіЇїЄєҐґ'’\- ]{2,50}", s))
 
 
 def normalize_games_answer(s: str) -> str | None:
-    """
-    Повертає одне з: "так", "ні", "не знаю" або None, якщо невалідно.
-    Дозволяємо також рос/укр варіанти для зручності.
-    """
-    t = clean(s).lower()
-    t = t.replace("ё", "е")
-
+    t = clean(s).lower().replace("ё", "е")
     if t in {"так", "да", "yes", "y"}:
         return "так"
     if t in {"ні", "ни", "нет", "no", "n"}:
         return "ні"
     if t in {"не знаю", "незнаю", "не знаю.", "не знаю!", "не знаю?"}:
         return "не знаю"
-    # інколи люди пишуть "не впевнений/не впевнена" — якщо хочеш, можна додати
     return None
 
 
@@ -82,7 +73,7 @@ async def init_db():
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Міграція для старої БД (якщо таблиця вже була без games_answer)
+        # миграция для старой БД
         try:
             await db.execute("ALTER TABLE registrations ADD COLUMN games_answer TEXT")
         except Exception:
@@ -124,20 +115,61 @@ async def fetch_all():
         return await cur.fetchall()
 
 
+async def notify_group(bot: Bot, chat_id: int, text: str) -> bool:
+    """
+    Надёжная отправка в группу:
+    - без Markdown (ничего не ломается на спецсимволах)
+    - retry при TelegramRetryAfter
+    - логирование ошибок
+    Возвращает True/False (успешно/нет)
+    """
+    try:
+        await bot.send_message(chat_id, text)
+        return True
+    except TelegramRetryAfter as e:
+        wait_s = int(e.retry_after) + 1
+        print(f"[GROUP] Rate limit. Sleep {wait_s}s then retry...")
+        await asyncio.sleep(wait_s)
+        try:
+            await bot.send_message(chat_id, text)
+            return True
+        except Exception as e2:
+            print(f"[GROUP] Retry failed: {e2}")
+            return False
+    except TelegramForbiddenError as e:
+        print(f"[GROUP] Forbidden (нет прав/бот удалён/ограничен): {e}")
+        return False
+    except TelegramBadRequest as e:
+        print(f"[GROUP] BadRequest: {e}\nTEXT={text}")
+        return False
+    except Exception as e:
+        print(f"[GROUP] Unknown error: {e}")
+        return False
+
+
+async def notify_admin_fallback(bot: Bot, text: str):
+    """Если задан ADMIN_ID — отправим тебе в личку как страховку."""
+    if ADMIN_ID:
+        try:
+            await bot.send_message(ADMIN_ID, "⚠️ Не вдалося надіслати в групу. Ось реєстрація:\n\n" + text)
+        except Exception as e:
+            print(f"[ADMIN FALLBACK] Failed: {e}")
+
+
 async def main():
     await init_db()
 
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
 
-    # прибираємо конфлікт, якщо раніше був webhook (Manybot тощо)
+    # убрать webhook-конфликт (если раньше был конструктор/вебхук)
     await bot.delete_webhook(drop_pending_updates=True)
 
-    # --- commands ---
     @dp.message(CommandStart())
     async def start(message: Message, state: FSMContext):
         await state.clear()
         await message.answer(
+            "Реєстрація на захід 📝\n\n"
             "Вкажи *ім'я* учасника:",
             parse_mode="Markdown"
         )
@@ -147,14 +179,6 @@ async def main():
     async def cancel(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("Скасовано. Щоб почати знову — /start")
-
-    @dp.message(Command("myid"))
-    async def myid(message: Message):
-        await message.answer(f"your_user_id: {message.from_user.id}")
-
-    @dp.message(Command("chatid"))
-    async def chatid(message: Message):
-        await message.answer(f"chat_id: {message.chat.id}")
 
     @dp.message(Command("export"))
     async def export_cmd(message: Message):
@@ -177,7 +201,6 @@ async def main():
         file = BufferedInputFile(data, filename="registrations.csv")
         await message.answer_document(file, caption=f"Всього реєстрацій: {len(rows)}")
 
-    # --- registration flow ---
     @dp.message(Reg.first_name)
     async def step_first_name(message: Message, state: FSMContext):
         name = clean(message.text)
@@ -214,7 +237,6 @@ async def main():
             return
 
         await state.update_data(age=age)
-
         await message.answer(
             "Чи грав(-ла) учасник в одну або кілька з цих ігор: "
             "Діксіт, Коднеймс (Кодові імена), Каркасон або Кольт Експрес?\n\n"
@@ -244,7 +266,6 @@ async def main():
             games_answer=ans
         )
 
-        # повідомлення користувачу
         await message.answer(
             "✅ Реєстрацію збережено!\n"
             f"Ім'я: {first_name}\n"
@@ -254,19 +275,21 @@ async def main():
             "Якщо треба змінити — натисни /start ще раз."
         )
 
-        # повідомлення в групу
         username = f"@{message.from_user.username}" if message.from_user.username else "—"
-        await bot.send_message(
-            GROUP_CHAT_ID,
-            "📝 *Нова реєстрація*\n"
-            f"• Ім'я: *{first_name}*\n"
-            f"• Прізвище/нік: *{last_or_nick}*\n"
-            f"• Вік: *{age}*\n"
-            f"• Грав(-ла) в ці ігри?: *{ans}*\n"
+
+        group_text = (
+            "📝 Нова реєстрація\n"
+            f"• Ім'я: {first_name}\n"
+            f"• Прізвище/нік: {last_or_nick}\n"
+            f"• Вік: {age}\n"
+            f"• Грав(-ла) в ці ігри?: {ans}\n"
             f"• TG: {username}\n"
-            f"• ID: `{message.from_user.id}`",
-            parse_mode="Markdown"
+            f"• ID: {message.from_user.id}"
         )
+
+        ok = await notify_group(bot, GROUP_CHAT_ID, group_text)
+        if not ok:
+            await notify_admin_fallback(bot, group_text)
 
         await state.clear()
 
